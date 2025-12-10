@@ -8,88 +8,152 @@ import (
 	"strconv"
 )
 
-type Socks5 struct {
+const (
+	Version = 5
+)
+
+type Server struct {
+	config      *Config
+	authMethods map[uint8]Authenticator
 }
 
-func (s *Socks5) HandleConnection(conn net.Conn) {
-	defer conn.Close() 
+type Config struct {
+	AuthMethods []Authenticator
+	Credential  CredentialStore
+}
 
-	buff := make([]byte, 512) 
+func New(conf *Config) (*Server, error) {
+	if len(conf.AuthMethods) == 0 {
+		if conf.Credential != nil {
+			conf.AuthMethods = []Authenticator{&UserPassAuthenticator{Credentials: conf.Credential}}
+		} else {
+			conf.AuthMethods = []Authenticator{&NoAuthAuthenticator{}}
+		}
+	}
+
+	server := &Server{
+		config: conf,
+	}
+
+	server.authMethods = make(map[uint8]Authenticator)
+	for _, a := range conf.AuthMethods {
+		server.authMethods[a.GetCode()] = a
+	}
+
+	return server, nil
+}
+
+func (s *Server) ServeConn(conn net.Conn) error {
+	defer conn.Close()
+
+	if err := s.authenticate(conn); err != nil {
+		return fmt.Errorf("authentication failed: %w", err)
+	}
+
+	return s.handleRequest(conn)
+}
+
+func (s *Server) authenticate(conn net.Conn) error {
+	buff := make([]byte, 257)
+
 	n, err := conn.Read(buff)
 	if err != nil || n < 2 {
-		return
+		return fmt.Errorf("failed to read greeting: %w", err)
 	}
 
-	if buff[0] != 0x05 {
-		return
+	if buff[0] != Version {
+		return fmt.Errorf("unsupported SOCKS version: %d", buff[0])
 	}
-	conn.Write([]byte{5, 0})
+	nmethods := int(buff[1])
+	if n < 2+nmethods {
+		return fmt.Errorf("incomplete greeting")
+	}
 
+	methods := buff[2 : 2+nmethods]
 
-	n, err = conn.Read(buff)
+	for _, method := range methods {
+		if auth, found := s.authMethods[method]; found {
+			return auth.Authenticate(conn, conn)
+		}
+	}
+
+	return noAcceptableAuth(conn)
+}
+
+func (s *Server) handleRequest(conn net.Conn) error {
+	buff := make([]byte, 512)
+	n, err := conn.Read(buff)
 	if err != nil || n < 4 {
-		return
+		return fmt.Errorf("failed to read request: %w", err)
 	}
 
-	if buff[0] != 0x05 {
-		return
+	if buff[0] != Version {
+		return fmt.Errorf("unsupported SOCKS version: %d", buff[0])
 	}
 
 	cmd := buff[1]
 	if cmd != 0x01 {
-		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) 
-		return
+		conn.Write([]byte{Version, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return fmt.Errorf("unsupported command: %d", cmd)
 	}
 
 	atyp := buff[3]
-
 	var host string
 	var port int
-
 	i := 4
 
-	if atyp == 0x01 {
+	switch atyp {
+	case 0x01: // IPv4
 		if n < i+4+2 {
-			return
+			return fmt.Errorf("incomplete IPv4 address")
 		}
 		host = net.IP(buff[i : i+4]).String()
 		i += 4
-	} else if atyp == 0x03 { 
+	case 0x03: // Domain
 		dlen := int(buff[i])
-		fmt.Println(dlen)
 		i++
 		if n < i+dlen+2 {
-			return
+			return fmt.Errorf("incomplete domain name")
 		}
 		host = string(buff[i : i+dlen])
 		i += dlen
-	} else if atyp == 0x04 { 
+	case 0x04: // IPv6
 		if n < i+16+2 {
-			return
+			return fmt.Errorf("incomplete IPv6 address")
 		}
 		host = net.IP(buff[i : i+16]).String()
 		i += 16
-	} else {
-		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) 
-		return
+	default:
+		conn.Write([]byte{Version, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return fmt.Errorf("unsupported address type: %d", atyp)
 	}
 
 	port = int(binary.BigEndian.Uint16(buff[i : i+2]))
-	target := net.JoinHostPort(host, stringPort(port))
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+
+	fmt.Printf("[PROXY] %s -> %s:%d\n", conn.RemoteAddr(), host, port)
 
 	dst, err := net.Dial("tcp", target)
 	if err != nil {
-		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) 
-		return
+		conn.Write([]byte{Version, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return fmt.Errorf("failed to connect to target: %w", err)
 	}
 	defer dst.Close()
 
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	conn.Write([]byte{Version, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	go io.Copy(dst, conn)
-	io.Copy(conn, dst)
-}
+	errCh := make(chan error, 2)
 
-func stringPort(p int) string {
-	return strconv.Itoa(p)
+	go func() {
+		_, err := io.Copy(dst, conn)
+		errCh <- err
+	}()
+
+	go func() {
+		_, err := io.Copy(conn, dst)
+		errCh <- err
+	}()
+
+	<-errCh
+	return nil
 }
