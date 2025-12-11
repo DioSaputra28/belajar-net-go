@@ -5,13 +5,22 @@ import (
 	"log"
 	"net"
 
+	httpconnect "github.com/DioSaputra28/belajar-net-go/android/http_connect"
 	"github.com/DioSaputra28/belajar-net-go/android/socks5"
 )
 
 func main() {
-	runNoAuthServer()
+	// runNoAuthServer()
 
 	// runUserPassServer()
+
+	// credentials := httpconnect.StaticCredentials{
+	// 	"admin": "rahasia",
+	// }
+
+	httpconnect.Server(&httpconnect.Config{
+		Auth:       &httpconnect.NoAuthAuthenticator{},
+	})
 }
 
 func runNoAuthServer() {
@@ -72,7 +81,7 @@ func runUserPassServer() {
 	}
 	defer listener.Close()
 
-	fmt.Println("🔐 SOCKS5 server (UserPass) started on :8080")
+	fmt.Println("SOCKS5 server (UserPass) started on :8080")
 	fmt.Println("Valid credentials:")
 	fmt.Println("  - alice:password123")
 	fmt.Println("  - bob:secret456")

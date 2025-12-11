@@ -20,6 +20,7 @@ type Server struct {
 type Config struct {
 	AuthMethods []Authenticator
 	Credential  CredentialStore
+	Permit      *PermitCommand
 }
 
 func New(conf *Config) (*Server, error) {
@@ -29,6 +30,10 @@ func New(conf *Config) (*Server, error) {
 		} else {
 			conf.AuthMethods = []Authenticator{&NoAuthAuthenticator{}}
 		}
+	}
+
+	if conf.Permit == nil {
+		conf.Permit = PermitAll().(*PermitCommand)
 	}
 
 	server := &Server{
@@ -91,10 +96,9 @@ func (s *Server) handleRequest(conn net.Conn) error {
 		return fmt.Errorf("unsupported SOCKS version: %d", buff[0])
 	}
 
-	cmd := buff[1]
-	if cmd != 0x01 {
-		conn.Write([]byte{Version, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return fmt.Errorf("unsupported command: %d", cmd)
+	err = s.config.Permit.Allow(conn, buff)
+	if err != nil {
+		return fmt.Errorf("permission denied: %w", err)
 	}
 
 	atyp := buff[3]
